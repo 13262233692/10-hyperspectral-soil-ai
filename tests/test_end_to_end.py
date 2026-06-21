@@ -227,6 +227,126 @@ def test_geotiff_writer():
     print("  GeoTIFF生成测试: PASSED")
 
 
+def test_wavelength_descending():
+    """波长降序场景全链路测试 - 模拟南方丘陵大雨冲刷批次
+
+    验证:
+        1. ENVI解码器正确嗅探 wavelength_order = descending
+        2. 解码后的数据立方体波段自动重排为升序
+        3. 预处理管道(SG滤波)正确处理降序输入
+        4. 推理引擎输出的Cd浓度不为负值
+        5. WavelengthReorderOperator 正确检测和重排
+    """
+    print("\n" + "=" * 60)
+    print("TEST 6: 波长降序场景 - 南方丘陵大雨冲刷批次")
+    print("=" * 60)
+
+    from hyperspectral_engine.decoding.envi_decoder import (
+        ENVIDecoder,
+        decode_gf5_cube,
+    )
+    from hyperspectral_engine.preprocessing.sg_filter import (
+        WavelengthReorderOperator,
+        PreprocessingPipeline,
+    )
+    from generate_test_data import generate_synthetic_envi
+
+    # 6a. 先生成升序数据，再用同一份物理内容(波段翻转)生成降序数据
+    tmpdir = tempfile.mkdtemp()
+    hdr_asc, dat_asc = generate_synthetic_envi(
+        tmpdir, samples=16, lines=12, wavelength_descending=False
+    )
+    cube_asc_ref, _ = decode_gf5_cube(hdr_asc, dat_asc)
+
+    hdr_desc, dat_desc = generate_synthetic_envi(
+        tmpdir, samples=16, lines=12, wavelength_descending=True,
+        source_cube=cube_asc_ref,
+    )
+
+    # 6b. 验证解码器嗅探到降序排列
+    decoder_desc = ENVIDecoder(hdr_desc, dat_desc)
+    meta_desc = decoder_desc.parse_header()
+    print(f"  Wavelength order detected: {meta_desc.wavelength_order}")
+    assert meta_desc.wavelength_order == "descending", \
+        f"Expected descending, got {meta_desc.wavelength_order}"
+
+    # 6c. 验证降序解码后的数据与升序解码一致
+    cube_desc = decoder_desc.decode()
+    assert cube_desc.shape == cube_asc_ref.shape
+    np.testing.assert_allclose(cube_desc, cube_asc_ref, rtol=1e-5)
+    print(f"  Descending cube auto-reordered to match ascending: shape={cube_desc.shape}")
+
+    # 6d. 验证 WavelengthReorderOperator
+    desc_wl = np.linspace(2500.0, 400.0, 330, dtype=np.float32)
+    reorder_op = WavelengthReorderOperator(desc_wl)
+    assert reorder_op.is_descending, "Should detect descending order"
+
+    test_spectrum_desc = np.arange(330, dtype=np.float32)
+    reordered = reorder_op.reorder_spectrum(test_spectrum_desc)
+    assert reordered[0] == 329.0, f"First element should be 329, got {reordered[0]}"
+    assert reordered[-1] == 0.0, f"Last element should be 0, got {reordered[-1]}"
+    print(f"  WavelengthReorderOperator: descending detected, spectrum flipped correctly")
+
+    # 6e. 验证预处理管道对降序波长的处理
+    pipeline_desc = PreprocessingPipeline(wavelengths=desc_wl)
+    assert pipeline_desc.is_wavelength_descending
+
+    rng = np.random.RandomState(99)
+    noisy_desc = rng.rand(330).astype(np.float32)
+    smoothed_desc = pipeline_desc.process_spectrum(noisy_desc)
+    assert smoothed_desc.shape == (330,)
+    assert np.all(np.isfinite(smoothed_desc))
+    print(f"  Descending-wavelength pipeline: spectrum processed OK")
+
+    batch_desc = rng.rand(8, 330).astype(np.float32)
+    batch_sm = pipeline_desc.process_batch(batch_desc)
+    assert batch_sm.shape == (8, 330)
+    print(f"  Descending-wavelength pipeline: batch processed OK")
+
+    # 6f. 验证升序和降序管道对相同物理光谱的处理结果一致
+    asc_wl = np.linspace(400.0, 2500.0, 330, dtype=np.float32)
+    pipeline_asc = PreprocessingPipeline(wavelengths=asc_wl)
+
+    rng2 = np.random.RandomState(42)
+    spec_asc = rng2.rand(330).astype(np.float32)
+    rng3 = np.random.RandomState(42)
+    spec_desc_input = rng3.rand(330).astype(np.float32)[::-1].copy()
+
+    result_asc = pipeline_asc.process_spectrum(spec_asc)
+    result_desc = pipeline_desc.process_spectrum(spec_desc_input)
+    np.testing.assert_allclose(result_asc, result_desc, rtol=1e-4)
+    print(f"  Ascending vs descending pipeline results match (rtol=1e-4)")
+
+    # 6g. 验证推理引擎对降序波长的处理(如果ONNX模型可用)
+    try:
+        from hyperspectral_engine.inference.onnx_engine import ONNXInferenceEngine
+        import onnxruntime
+
+        tmpdir2 = tempfile.mkdtemp()
+        from hyperspectral_engine.training.train import build_model, export_to_onnx
+        import torch
+        model = build_model(spectral_length=330, device="cpu")
+        onnx_path = os.path.join(tmpdir2, "desc_test.onnx")
+        export_to_onnx(model, onnx_path, spectral_length=330, device="cpu")
+
+        engine = ONNXInferenceEngine(onnx_path, use_gpu=False)
+        engine.set_wavelengths(desc_wl)
+
+        rng4 = np.random.RandomState(55)
+        spec_for_infer = rng4.rand(330).astype(np.float32)
+        result = engine.predict_single(spec_for_infer)
+        print(f"  Descending-wavelength inference: Cd={result['Cd']:.4f}, "
+              f"Pb={result['Pb']:.4f}, As={result['As']:.4f}")
+        assert result["Cd"] >= 0, f"Cd should be non-negative, got {result['Cd']}"
+        assert result["Pb"] >= 0, f"Pb should be non-negative, got {result['Pb']}"
+        assert result["As"] >= 0, f"As should be non-negative, got {result['As']}"
+        print(f"  All concentrations non-negative: PASSED")
+    except (ImportError, FileNotFoundError):
+        print(f"  ONNX inference test skipped (missing deps)")
+
+    print("  波长降序场景全链路测试: PASSED")
+
+
 def main():
     print("\n" + "#" * 60)
     print("#  星载高光谱污染智能反演引擎 - 端到端集成测试")
@@ -267,6 +387,14 @@ def main():
         print(f"  FAILED: {e}")
         traceback.print_exc()
         results.append(("GeoTIFF Writer", f"FAILED: {e}"))
+
+    try:
+        test_wavelength_descending()
+        results.append(("Wavelength Descending", "PASSED"))
+    except Exception as e:
+        print(f"  FAILED: {e}")
+        traceback.print_exc()
+        results.append(("Wavelength Descending", f"FAILED: {e}"))
 
     print("\n" + "#" * 60)
     print("#  测试结果汇总")

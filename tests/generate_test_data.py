@@ -1,16 +1,18 @@
 """合成GF-5 ENVI格式测试数据生成器
 
 生成符合ENVI规范的.hdr和.dat文件，用于系统集成测试。
+支持升序和降序波长排列，模拟南方丘陵大雨冲刷批次传感器数据。
 """
 
 import os
 import struct
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 SPECTRAL_LENGTH = 330
-WAVELENGTHS = np.linspace(400.0, 2500.0, SPECTRAL_LENGTH, dtype=np.float32)
+WAVELENGTHS_ASC = np.linspace(400.0, 2500.0, SPECTRAL_LENGTH, dtype=np.float32)
+WAVELENGTHS_DESC = np.linspace(2500.0, 400.0, SPECTRAL_LENGTH, dtype=np.float32)
 FWHM = np.full(SPECTRAL_LENGTH, 5.0, dtype=np.float32)
 
 
@@ -22,10 +24,20 @@ def write_envi_header(
     interleave: str = "BSQ",
     data_type: int = 4,
     byte_order: int = 0,
+    wavelength_descending: bool = False,
 ) -> None:
-    """写入ENVI .hdr头文件"""
-    wl_str = ", ".join(f"{w:.4f}" for w in WAVELENGTHS)
+    """写入ENVI .hdr头文件
+
+    Args:
+        wavelength_descending: 是否生成波长降序排列的头文件
+    """
+    wl = WAVELENGTHS_DESC if wavelength_descending else WAVELENGTHS_ASC
+    wl_str = ", ".join(f"{w:.4f}" for w in wl)
     fwhm_str = ", ".join(f"{w:.2f}" for w in FWHM)
+
+    wl_order_line = ""
+    if wavelength_descending:
+        wl_order_line = "wavelength order = descending\n"
 
     header = f"""ENVI
 description = {{ Synthetic GF-5 Hyperspectral Data for Testing }}
@@ -38,7 +50,7 @@ data type = {data_type}
 interleave = {interleave}
 byte order = {byte_order}
 wavelength units = Nanometers
-wavelength = {{ {wl_str} }}
+{wl_order_line}wavelength = {{ {wl_str} }}
 fwhm = {{ {fwhm_str} }}
 map info = {{ Geographic Lat/Lon, 1, 1, 116.391, 39.907, 0.0002695, 0.0002695, WGS-84 }}
 coordinate system string = {{ GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["Degree",0.017453292519943295]] }}
@@ -71,6 +83,8 @@ def generate_synthetic_envi(
     lines: int = 128,
     seed: int = 42,
     noise_std: float = 0.015,
+    wavelength_descending: bool = False,
+    source_cube: Optional[np.ndarray] = None,
 ) -> Tuple[str, str]:
     """生成合成GF-5 ENVI数据集
 
@@ -80,29 +94,39 @@ def generate_synthetic_envi(
         lines: 图像高度
         seed: 随机种子
         noise_std: 噪声标准差
+        wavelength_descending: 是否生成波长降序排列的数据
+        source_cube: 可选，直接使用给定立方体(波段翻转写入以匹配降序头)
 
     Returns:
         (hdr_path, dat_path)
     """
     os.makedirs(output_dir, exist_ok=True)
-    rng = np.random.RandomState(seed)
 
-    base_hdr = os.path.join(output_dir, "gf5_test.hdr")
-    base_dat = os.path.join(output_dir, "gf5_test.dat")
-    write_envi_header(base_hdr, samples, lines)
+    suffix = "_desc" if wavelength_descending else ""
+    base_hdr = os.path.join(output_dir, f"gf5_test{suffix}.hdr")
+    base_dat = os.path.join(output_dir, f"gf5_test{suffix}.dat")
+    write_envi_header(base_hdr, samples, lines, wavelength_descending=wavelength_descending)
 
     H, W, C = lines, samples, SPECTRAL_LENGTH
-    cube = np.zeros((C, H, W), dtype=np.float32)
 
-    for y in range(H):
-        for x in range(W):
-            base_type = rng.randint(0, 3)
-            cd = rng.uniform(0.05, 6.0)
-            pb = rng.uniform(5.0, 250.0)
-            as_ = rng.uniform(1.0, 60.0)
-            spectrum = _soil_spectrum(WAVELENGTHS, base_type, cd, pb, as_)
-            spectrum += rng.normal(0.0, noise_std, C).astype(np.float32)
-            cube[:, y, x] = np.clip(spectrum, 0.0, 1.0)
+    if source_cube is not None:
+        cube = source_cube
+        if wavelength_descending:
+            cube = cube[::-1, :, :].copy()
+    else:
+        rng = np.random.RandomState(seed)
+        wl_for_gen = WAVELENGTHS_DESC if wavelength_descending else WAVELENGTHS_ASC
+        cube = np.zeros((C, H, W), dtype=np.float32)
+
+        for y in range(H):
+            for x in range(W):
+                base_type = rng.randint(0, 3)
+                cd = rng.uniform(0.05, 6.0)
+                pb = rng.uniform(5.0, 250.0)
+                as_ = rng.uniform(1.0, 60.0)
+                spectrum = _soil_spectrum(wl_for_gen, base_type, cd, pb, as_)
+                spectrum += rng.normal(0.0, noise_std, C).astype(np.float32)
+                cube[:, y, x] = np.clip(spectrum, 0.0, 1.0)
 
     with open(base_dat, "wb") as f:
         f.write(cube.astype(np.float32).tobytes())

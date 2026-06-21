@@ -4,14 +4,16 @@
     - 严格解耦：本模块不依赖 PyTorch
     - 极低延迟：session级复用、GraphOptimization
     - 线程安全：支持多线程并发推理
-    - 多执行提供方
-    - 自动回退：CPU/GPU自动选择
+    - 波长排序感知: 预处理管道自动检测并重排降序波长
+    - 内存安全: predict_cube切片分发无闭包逃逸
 
 只依赖 numpy 和 onnxruntime
 """
 
 import os
+import gc
 import time
+import weakref
 import threading
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -123,6 +125,18 @@ class ONNXInferenceEngine:
     def providers(self) -> List[str]:
         return self._providers
 
+    def set_wavelengths(self, wavelengths: np.ndarray) -> None:
+        """运行时动态注入波长信息
+
+        当数据源从晴空干燥区切换到南方丘陵大雨批次时，
+        调用此方法将ENVI元数据中的波长数组注入预处理管道，
+        触发波长排序嗅探和吸收带掩码重建。
+
+        Args:
+            wavelengths: 实际波长数组 (可能为降序排列)
+        """
+        self._pipeline.set_wavelengths(wavelengths)
+
     def _preprocess(self, spectra: np.ndarray) -> Tuple[np.ndarray, float]:
         t0 = time.perf_counter()
         x = np.asarray(spectra, dtype=np.float32)
@@ -186,31 +200,55 @@ class ONNXInferenceEngine:
         cube: np.ndarray,
         batch_size: int = 256,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """推理整个高光谱立方体 [C, H, W]
+
+        内存安全设计:
+            - 逐批推理后立即提取标量结果写入预分配数组
+            - 显式删除中间InferenceResult引用
+            - 每批次结束触发分代回收标记
+            - 无闭包捕获: 输出数组独立于推理结果对象生命周期
+
+        Args:
+            cube: [C, H, W] 反射率张量
+            batch_size: 推理批大小
+
+        Returns:
+            (Cd_map, Pb_map, As_map): 每个都是 [H, W] 浓度图 (mg/kg)
+        """
         C, H, W = cube.shape
         if C != self._spectral_length:
             raise ValueError(
                 f"Expected {self._spectral_length} bands, got {C}"
             )
 
-        pixels = cube.transpose(1, 2, 0).reshape(-1, C)
+        pixels = np.ascontiguousarray(
+            cube.transpose(1, 2, 0).reshape(-1, C)
+        )
         N = pixels.shape[0]
 
-        cds = np.zeros(N, dtype=np.float32)
-        pbs = np.zeros(N, dtype=np.float32)
-        ass = np.zeros(N, dtype=np.float32)
+        cds = np.empty(N, dtype=np.float32)
+        pbs = np.empty(N, dtype=np.float32)
+        ass = np.empty(N, dtype=np.float32)
 
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
-            batch = pixels[start:end]
-            res = self.predict(batch)
+            batch_pixels = np.ascontiguousarray(pixels[start:end])
+            res = self.predict(batch_pixels)
             cds[start:end] = res.Cd
             pbs[start:end] = res.Pb
             ass[start:end] = res.As
+            del res, batch_pixels
+
+            if start % (batch_size * 4) == 0 and start > 0:
+                gc.collect(generation=0)
+
+        del pixels
+        gc.collect(generation=0)
 
         return (
-            cds.reshape(H, W),
-            pbs.reshape(H, W),
-            ass.reshape(H, W),
+            np.ascontiguousarray(cds.reshape(H, W)),
+            np.ascontiguousarray(pbs.reshape(H, W)),
+            np.ascontiguousarray(ass.reshape(H, W)),
         )
 
     def benchmark(

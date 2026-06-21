@@ -34,6 +34,7 @@ class ENVIMetadata:
     offset: List[float] = field(default_factory=list)
     map_info: Optional[Dict] = None
     raw_fields: Dict[str, str] = field(default_factory=dict)
+    wavelength_order: str = "ascending"
 
 
 class ENVIDecoder:
@@ -120,7 +121,27 @@ class ENVIDecoder:
         _commit()
 
         self.metadata = meta
+        self._sniff_wavelength_order(meta)
         return meta
+
+    @staticmethod
+    def _sniff_wavelength_order(meta: ENVIMetadata) -> None:
+        """动态嗅探波长排序方向
+
+        当ENVI头文件未显式声明 wavelength order 标志位时，
+        通过检查wavelength数组前N个元素的单调性推断排序方向。
+        南方丘陵大雨冲刷批次传感器可能下发波长降序排列的数据卷。
+        """
+        if not meta.wavelength or len(meta.wavelength) < 2:
+            return
+        wl = meta.wavelength
+        n_check = min(10, len(wl))
+        asc_count = sum(1 for i in range(1, n_check) if wl[i] > wl[i - 1])
+        desc_count = sum(1 for i in range(1, n_check) if wl[i] < wl[i - 1])
+        if desc_count > asc_count:
+            meta.wavelength_order = "descending"
+        else:
+            meta.wavelength_order = "ascending"
 
     @staticmethod
     def _parse_header_field(meta: ENVIMetadata, key: str, value: str) -> None:
@@ -144,6 +165,12 @@ class ENVIDecoder:
             setattr(meta, key, nums)
         elif key == "map info" or key == "map_info":
             meta.map_info = ENVIDecoder._parse_map_info(value)
+        elif key == "wavelength order" or key == "wavelength_order":
+            val_lower = value.strip().lower()
+            if "descend" in val_lower or "reverse" in val_lower or "decreas" in val_lower:
+                meta.wavelength_order = "descending"
+            else:
+                meta.wavelength_order = "ascending"
 
     @staticmethod
     def _parse_numeric_list(value: str) -> List[float]:
@@ -255,6 +282,9 @@ class ENVIDecoder:
         else:
             raise ValueError(f"Unsupported interleave: {meta.interleave}")
 
+        if meta.wavelength_order == "descending":
+            cube = cube[::-1, :, :].copy()
+
         return np.ascontiguousarray(cube)
 
     def decode_pixel(self, line: int, sample: int) -> np.ndarray:
@@ -320,6 +350,9 @@ class ENVIDecoder:
         else:
             raise ValueError(f"Unsupported interleave: {meta.interleave}")
 
+        if meta.wavelength_order == "descending":
+            spectrum = spectrum[::-1].copy()
+
         return spectrum
 
     def get_spatial_shape(self) -> Tuple[int, int, int]:
@@ -329,10 +362,13 @@ class ENVIDecoder:
         return (self.metadata.bands, self.metadata.lines, self.metadata.samples)
 
     def get_wavelengths(self) -> np.ndarray:
-        """返回中心波长数组 (nm)"""
+        """返回中心波长数组 (nm)，始终按升序排列"""
         if self.metadata is None:
             self.parse_header()
-        return np.array(self.metadata.wavelength, dtype=np.float32)
+        wl = np.array(self.metadata.wavelength, dtype=np.float32)
+        if self.metadata.wavelength_order == "descending":
+            wl = wl[::-1].copy()
+        return wl
 
 
 def decode_gf5_cube(
