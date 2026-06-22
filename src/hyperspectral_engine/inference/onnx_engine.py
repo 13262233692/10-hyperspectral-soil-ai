@@ -6,6 +6,7 @@
     - 线程安全：支持多线程并发推理
     - 波长排序感知: 预处理管道自动检测并重排降序波长
     - 内存安全: predict_cube切片分发无闭包逃逸
+    - 纯度干预: 地膜遮蔽图斑静默阻断重金属反演
 
 只依赖 numpy 和 onnxruntime
 """
@@ -26,6 +27,7 @@ except ImportError:
     ort = None
 
 from ..preprocessing.sg_filter import PreprocessingPipeline
+from ..unmixing.intervention import PurityInterventionModule, InterventionPayload
 
 
 TARGET_METALS = ["Cd", "Pb", "As"]
@@ -39,6 +41,7 @@ class InferenceResult:
     inference_time_ms: float
     preprocess_time_ms: float
     batch_size: int
+    intervention: Optional[InterventionPayload] = None
 
 
 class ONNXInferenceEngine:
@@ -55,6 +58,9 @@ class ONNXInferenceEngine:
         inter_op_num_threads: int = 0,
         enable_optimization: bool = True,
         preprocessing_config: Optional[Dict] = None,
+        enable_intervention: bool = True,
+        mulch_sam_threshold: float = 0.05,
+        intervention_num_endmembers: int = 4,
     ):
         if ort is None:
             raise ImportError(
@@ -80,6 +86,14 @@ class ONNXInferenceEngine:
 
         pp_cfg = preprocessing_config or {}
         self._pipeline = PreprocessingPipeline(**pp_cfg)
+
+        self._enable_intervention = enable_intervention
+        self._intervention_module: Optional[PurityInterventionModule] = None
+        if enable_intervention:
+            self._intervention_module = PurityInterventionModule(
+                mulch_sam_threshold=mulch_sam_threshold,
+                num_endmembers=intervention_num_endmembers,
+            )
 
         self._build_session()
 
@@ -199,7 +213,8 @@ class ONNXInferenceEngine:
         self,
         cube: np.ndarray,
         batch_size: int = 256,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        intervention_patch_size: int = 16,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[InterventionPayload]]:
         """推理整个高光谱立方体 [C, H, W]
 
         内存安全设计:
@@ -208,12 +223,21 @@ class ONNXInferenceEngine:
             - 每批次结束触发分代回收标记
             - 无闭包捕获: 输出数组独立于推理结果对象生命周期
 
+        纯度干预旁路:
+            - 将立方体切分为 patch_size x patch_size 图斑
+            - 对每个图斑执行VCA端元解混 + 地膜SAM判定
+            - 地膜遮蔽图斑内像素Cd/Pb/As设为NaN(静默阻断)
+            - 返回干预净荷供WebGIS渲染警示网格
+
         Args:
             cube: [C, H, W] 反射率张量
             batch_size: 推理批大小
+            intervention_patch_size: 干预检测图斑大小
 
         Returns:
-            (Cd_map, Pb_map, As_map): 每个都是 [H, W] 浓度图 (mg/kg)
+            (Cd_map, Pb_map, As_map, intervention_payload):
+                Cd/Pb/As: [H, W] 浓度图(mg/kg), 被阻断像素为NaN
+                intervention_payload: 干预净荷(无干预时为None)
         """
         C, H, W = cube.shape
         if C != self._spectral_length:
@@ -230,6 +254,46 @@ class ONNXInferenceEngine:
         pbs = np.empty(N, dtype=np.float32)
         ass = np.empty(N, dtype=np.float32)
 
+        intervention_payload: Optional[InterventionPayload] = None
+        blocked_pixels = np.zeros(N, dtype=bool)
+
+        if self._enable_intervention and self._intervention_module is not None:
+            patch_size = intervention_patch_size
+            n_patches_h = max(1, H // patch_size)
+            n_patches_w = max(1, W // patch_size)
+            ph = H // n_patches_h
+            pw = W // n_patches_w
+
+            for pi in range(n_patches_h):
+                for pj in range(n_patches_w):
+                    r0 = pi * ph
+                    r1 = min(r0 + ph, H)
+                    c0 = pj * pw
+                    c1 = min(c0 + pw, W)
+                    patch = cube[:, r0:r1, c0:c1]
+                    patch_pixels = patch.reshape(C, -1)
+
+                    if patch_pixels.shape[1] < self._intervention_module.min_pixels:
+                        continue
+
+                    payload = self._intervention_module.analyze_patch(patch_pixels)
+
+                    if payload.blocked and payload.mulch_detected:
+                        intervention_payload = payload
+                        mulch_idx = payload.mulch_endmember_index
+                        if payload.abundance_profile is not None and mulch_idx >= 0:
+                            mulch_ab = payload.abundance_profile[mulch_idx, :]
+                            ab_threshold = float(mulch_ab.mean())
+                            patch_blocked = mulch_ab >= ab_threshold
+                            for k, local_idx in enumerate(range(patch_pixels.shape[1])):
+                                if patch_blocked[k]:
+                                    global_row = r0 + local_idx // (c1 - c0)
+                                    global_col = c0 + local_idx % (c1 - c0)
+                                    global_idx = global_row * W + global_col
+                                    if 0 <= global_idx < N:
+                                        blocked_pixels[global_idx] = True
+                        del payload
+
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
             batch_pixels = np.ascontiguousarray(pixels[start:end])
@@ -242,6 +306,10 @@ class ONNXInferenceEngine:
             if start % (batch_size * 4) == 0 and start > 0:
                 gc.collect(generation=0)
 
+        cds[blocked_pixels] = np.nan
+        pbs[blocked_pixels] = np.nan
+        ass[blocked_pixels] = np.nan
+
         del pixels
         gc.collect(generation=0)
 
@@ -249,6 +317,7 @@ class ONNXInferenceEngine:
             np.ascontiguousarray(cds.reshape(H, W)),
             np.ascontiguousarray(pbs.reshape(H, W)),
             np.ascontiguousarray(ass.reshape(H, W)),
+            intervention_payload,
         )
 
     def benchmark(

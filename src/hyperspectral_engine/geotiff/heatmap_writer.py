@@ -326,3 +326,106 @@ class PollutionHeatmapWriter:
                 dst.build_overviews([2, 4, 8], Resampling.average)
 
         return os.path.abspath(output_path)
+
+    def write_intervention_overlay(
+        self,
+        concentration_map: np.ndarray,
+        intervention_mask: np.ndarray,
+        output_path: str,
+        crosshatch_spacing: int = 4,
+        crosshatch_width: int = 1,
+        apply_smoothing: bool = True,
+    ) -> str:
+        """写入鲜黄色斜十字交叉警示网格叠加层GeoTIFF
+
+        在土壤热力图层上方强制覆盖渲染极高反差的警示网格,
+        用于WebGIS终端展示地膜白色污染遮蔽干预区域。
+
+        Args:
+            concentration_map: [H, W] 浓度图(底层渲染参考)
+            intervention_mask: [H, W] 干预布尔掩码(>0=需覆盖区域)
+            output_path: 输出.tif路径
+            crosshatch_spacing: 十字线间距(像素)
+            crosshatch_width: 线宽(像素)
+            apply_smoothing: 底层浓度图是否平滑
+
+        Returns:
+            绝对路径
+        """
+        if apply_smoothing:
+            base = self.smoother.smooth(concentration_map)
+        else:
+            base = concentration_map.astype(np.float32)
+
+        norm = self._normalize_to_uint8(base)
+        base_rgba = self.apply_colormap(norm)
+        H, W = norm.shape
+
+        mask = (np.asarray(intervention_mask) > 0).astype(np.float32)
+
+        rows, cols = np.where(mask > 0)
+        if len(rows) > 0:
+            diag1 = (rows - cols) % crosshatch_spacing < crosshatch_width
+            diag2 = (rows + cols) % crosshatch_spacing < crosshatch_width
+            crosshatch = diag1 | diag2
+
+            overlay_r = base_rgba[0].copy()
+            overlay_g = base_rgba[1].copy()
+            overlay_b = base_rgba[2].copy()
+            overlay_a = np.full((H, W), 255, dtype=np.uint8)
+
+            overlay_r[rows[crosshatch], cols[crosshatch]] = 255
+            overlay_g[rows[crosshatch], cols[crosshatch]] = 255
+            overlay_b[rows[crosshatch], cols[crosshatch]] = 0
+
+            non_hatch = ~crosshatch
+            if np.any(non_hatch):
+                nr, nc = rows[non_hatch], cols[non_hatch]
+                overlay_r[nr, nc] = np.clip(
+                    overlay_r[nr, nc].astype(np.int16) + 80, 0, 255
+                ).astype(np.uint8)
+                overlay_g[nr, nc] = np.clip(
+                    overlay_g[nr, nc].astype(np.int16) + 80, 0, 255
+                ).astype(np.uint8)
+        else:
+            overlay_r = base_rgba[0]
+            overlay_g = base_rgba[1]
+            overlay_b = base_rgba[2]
+            overlay_a = np.full((H, W), 255, dtype=np.uint8)
+
+        transform = self._get_transform(H, W)
+        crs = rasterio.crs.CRS.from_epsg(self.config.crs_epsg)
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+
+        with rasterio.open(
+            output_path,
+            "w",
+            driver="GTiff",
+            height=H,
+            width=W,
+            count=4,
+            dtype="uint8",
+            crs=crs,
+            transform=transform,
+            compress=self.config.compression,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+            photometric="RGB",
+            alpha="premultiplied",
+        ) as dst:
+            dst.write(overlay_r, 1)
+            dst.write(overlay_g, 2)
+            dst.write(overlay_b, 3)
+            dst.write(overlay_a, 4)
+            dst.update_tags(
+                TIFFTAG_SOFTWARE="HyperspectralSoilAI",
+                INTERVENTION="mulch_contamination_blocked",
+                CROSSHATCH_SPACING=str(crosshatch_spacing),
+                CROSSHATCH_COLOR="FFFF00",
+            )
+            if self.config.build_pyramids:
+                dst.build_overviews([2, 4, 8, 16], Resampling.bilinear)
+
+        return os.path.abspath(output_path)

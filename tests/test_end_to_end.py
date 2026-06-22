@@ -162,7 +162,7 @@ def test_onnx_inference(onnx_path: str):
 
     cube = rng.rand(330, 20, 25).astype(np.float32)
     t0 = time.perf_counter()
-    cd_map, pb_map, as_map = engine.predict_cube(cube)
+    cd_map, pb_map, as_map, _ = engine.predict_cube(cube)
     dt = (time.perf_counter() - t0) * 1000
     assert cd_map.shape == (20, 25)
     print(f"  Cube inference OK (20x25) in {dt:.1f}ms")
@@ -347,6 +347,156 @@ def test_wavelength_descending():
     print("  波长降序场景全链路测试: PASSED")
 
 
+def test_vca_intervention():
+    """VCA端元解混+地膜纯度干预全链路测试
+
+    验证:
+        1. VCA从混合光谱中正确提取端元
+        2. SAM光谱角匹配正确识别地膜端元
+        3. 地膜丰度超过阈值时干预模块阻断反演
+        4. 干预净荷包含正确的端元丰度信息
+        5. 鲜黄色斜十字警示网格叠加层生成正确
+    """
+    print("\n" + "=" * 60)
+    print("TEST 7: VCA端元解混 + 地膜纯度干预")
+    print("=" * 60)
+
+    from hyperspectral_engine.unmixing.vca import vca, fully_constrained_abundance
+    from hyperspectral_engine.unmixing.spectral_endmembers import (
+        get_endmember,
+        spectral_angle,
+        spectral_angle_batch,
+        best_matching_endmember,
+    )
+    from hyperspectral_engine.unmixing.intervention import (
+        PurityInterventionModule,
+        InterventionPayload,
+        MULCH_SAM_THRESHOLD,
+    )
+
+    rng = np.random.RandomState(42)
+
+    mulch_ref = get_endmember("polyethylene_mulch")
+    veg_ref = get_endmember("green_vegetation")
+    soil_ref = get_endmember("bare_soil")
+
+    L = 330
+    N_clean = 200
+    N_mulch = 200
+
+    clean_spectra = np.zeros((L, N_clean), dtype=np.float32)
+    for i in range(N_clean):
+        a_soil = rng.uniform(0.5, 0.8)
+        a_veg = 1.0 - a_soil
+        clean_spectra[:, i] = a_soil * soil_ref + a_veg * veg_ref
+
+    mulch_spectra = np.zeros((L, N_mulch), dtype=np.float32)
+    for i in range(N_mulch):
+        a_mulch = rng.uniform(0.6, 0.95)
+        a_soil = (1.0 - a_mulch) * rng.uniform(0.3, 0.7)
+        a_veg = 1.0 - a_mulch - a_soil
+        mulch_spectra[:, i] = a_mulch * mulch_ref + a_soil * soil_ref + a_veg * veg_ref
+
+    all_spectra = np.hstack([clean_spectra, mulch_spectra])
+    noise = rng.randn(*all_spectra.shape).astype(np.float32) * 0.005
+    all_spectra = np.clip(all_spectra + noise, 0.0, 1.0)
+
+    # 7a. VCA端元提取
+    endmembers, indices = vca(all_spectra, num_endmembers=3)
+    assert endmembers.shape == (L, 3), f"Expected (330,3), got {endmembers.shape}"
+    print(f"  VCA extracted {endmembers.shape[1]} endmembers from {all_spectra.shape[1]} pixels")
+
+    # 7b. SAM匹配
+    labels = []
+    sam_angles = []
+    for i in range(3):
+        name, angle = best_matching_endmember(endmembers[:, i])
+        labels.append(name)
+        sam_angles.append(angle)
+        print(f"  Endmember {i}: best match = {name}, SAM = {angle:.4f} rad")
+
+    assert "polyethylene_mulch" in labels, \
+        f"VCA should find mulch endmember, got labels: {labels}"
+
+    # 7c. FCLS丰度分解
+    abundances = fully_constrained_abundance(all_spectra, endmembers)
+    assert abundances.shape == (3, N_clean + N_mulch)
+    col_sums = abundances.sum(axis=0)
+    np.testing.assert_allclose(col_sums, 1.0, atol=0.1)
+    print(f"  FCLS abundance sums: min={col_sums.min():.3f}, max={col_sums.max():.3f}")
+
+    mulch_label_idx = labels.index("polyethylene_mulch")
+    mulch_ab = abundances[mulch_label_idx, :]
+    mulch_pixels_ab = mulch_ab[N_clean:]
+    clean_pixels_ab = mulch_ab[:N_clean]
+    print(f"  Mulch pixels abundance: mean={mulch_pixels_ab.mean():.3f}, max={mulch_pixels_ab.max():.3f}")
+    print(f"  Clean pixels abundance: mean={clean_pixels_ab.mean():.3f}")
+
+    # 7d. 纯度干预模块 - 地膜污染图斑
+    module = PurityInterventionModule(
+        mulch_sam_threshold=MULCH_SAM_THRESHOLD,
+        num_endmembers=3,
+    )
+
+    payload_mulch = module.analyze_patch(mulch_spectra)
+    assert payload_mulch.mulch_detected, "Should detect mulch in contaminated patch"
+    assert payload_mulch.blocked, "Should block inference for contaminated patch"
+    assert payload_mulch.mulch_sam_angle < MULCH_SAM_THRESHOLD
+    print(f"  Mulch patch: blocked={payload_mulch.blocked}, "
+          f"SAM={payload_mulch.mulch_sam_angle:.4f}, "
+          f"abundance_mean={payload_mulch.mulch_abundance_mean:.4f}")
+
+    # 7e. 纯度干预模块 - 干净图斑
+    payload_clean = module.analyze_patch(clean_spectra)
+    print(f"  Clean patch: blocked={payload_clean.blocked}, "
+          f"mulch_detected={payload_clean.mulch_detected}")
+    if payload_clean.mulch_detected:
+        print(f"    SAM={payload_clean.mulch_sam_angle:.4f} (threshold={MULCH_SAM_THRESHOLD})")
+
+    # 7f. 单像素快速检测
+    test_pixel_clean = clean_spectra[:, 0]
+    is_blocked, angle = module.analyze_pixel(test_pixel_clean)
+    print(f"  Single pixel (clean): blocked={is_blocked}, SAM={angle:.4f}")
+
+    test_pixel_mulch = mulch_spectra[:, 0]
+    is_blocked_m, angle_m = module.analyze_pixel(test_pixel_mulch)
+    print(f"  Single pixel (mulch): blocked={is_blocked_m}, SAM={angle_m:.4f}")
+
+    # 7g. 鲜黄色斜十字警示网格
+    H, W = 12, 16
+    warning_mask = np.zeros((H, W), dtype=np.float32)
+    warning_mask[2:8, 3:12] = 1.0
+
+    overlay = PurityInterventionModule.build_crosshatch_overlay(
+        warning_mask, spacing=4, line_width=1
+    )
+    assert overlay.shape == (H, W, 4), f"Expected ({H},{W},4), got {overlay.shape}"
+    assert overlay.dtype == np.uint8
+
+    mask_pixels = np.where(warning_mask > 0)
+    hatched_r, hatched_c = mask_pixels[0], mask_pixels[1]
+    diag1 = (hatched_r - hatched_c) % 4 < 1
+    diag2 = (hatched_r + hatched_c) % 4 < 1
+    crosshatch_mask = diag1 | diag2
+
+    hatched_pixels = overlay[hatched_r[crosshatch_mask], hatched_c[crosshatch_mask]]
+    assert np.all(hatched_pixels[:, 0] == 255), "Crosshatch R should be 255"
+    assert np.all(hatched_pixels[:, 1] == 255), "Crosshatch G should be 255"
+    assert np.all(hatched_pixels[:, 2] == 0), "Crosshatch B should be 0"
+    assert np.all(hatched_pixels[:, 3] == 200), "Crosshatch A should be 200"
+    print(f"  Crosshatch overlay: shape={overlay.shape}, yellow=#FFFF00, alpha=200")
+
+    # 7h. 干预净荷序列化
+    payload_dict = payload_mulch.to_dict()
+    assert payload_dict["blocked"] is True
+    assert payload_dict["mulch_detected"] is True
+    assert "endmember_labels" in payload_dict
+    assert "abundance_means" in payload_dict
+    print(f"  Intervention payload serialized OK: {list(payload_dict.keys())}")
+
+    print("  VCA解混+地膜干预测试: PASSED")
+
+
 def main():
     print("\n" + "#" * 60)
     print("#  星载高光谱污染智能反演引擎 - 端到端集成测试")
@@ -395,6 +545,14 @@ def main():
         print(f"  FAILED: {e}")
         traceback.print_exc()
         results.append(("Wavelength Descending", f"FAILED: {e}"))
+
+    try:
+        test_vca_intervention()
+        results.append(("VCA Intervention", "PASSED"))
+    except Exception as e:
+        print(f"  FAILED: {e}")
+        traceback.print_exc()
+        results.append(("VCA Intervention", f"FAILED: {e}"))
 
     print("\n" + "#" * 60)
     print("#  测试结果汇总")

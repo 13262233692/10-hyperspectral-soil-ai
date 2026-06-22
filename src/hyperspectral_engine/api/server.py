@@ -5,6 +5,7 @@
     POST /api/v1/inference/batch       - 批量光谱推理
     POST /api/v1/inference/cube        - 数据立方体推理 -> GeoTIFF
     POST /api/v1/decode/envi           - ENVI原始数据解码
+    POST /api/v1/intervention/analyze  - 图斑纯度干预分析
     GET  /api/v1/health                - 健康检查
     GET  /api/v1/status                - 引擎状态
     POST /api/v1/train                 - 触发离线训练 (可选)
@@ -32,6 +33,7 @@ from ..geotiff.heatmap_writer import (
     GeoTIFFConfig,
     SOIL_STANDARDS,
 )
+from ..unmixing.intervention import PurityInterventionModule, InterventionPayload
 
 
 APP_TITLE = "星载高光谱土壤污染智能反演引擎"
@@ -96,6 +98,33 @@ class CubeInferenceResponse(BaseModel):
     rgba_heatmap_url: str
     processing_time_s: float
     spatial_shape: List[int]
+    intervention: Optional[Dict[str, Any]] = None
+    intervention_overlay_url: Optional[str] = None
+
+
+class InterventionPopupPayload(BaseModel):
+    blocked: bool
+    mulch_detected: bool
+    mulch_sam_angle: float
+    mulch_abundance_mean: float
+    mulch_abundance_max: float
+    mulch_endmember_index: int
+    num_endmembers: int
+    endmember_labels: List[str]
+    endmember_sam_angles: List[float]
+    abundance_means: List[float]
+    abundance_profile_shape: Optional[List[int]] = None
+    popup_title: str = "⚠ 农田地膜白色污染遮蔽确认"
+    popup_message: str = ""
+    overlay_url: Optional[str] = None
+
+
+class InterventionAnalyzeRequest(BaseModel):
+    spectra: List[List[float]] = Field(..., description="N x 330 图斑像素光谱矩阵")
+    patch_height: int = Field(16, description="图斑高度(像素)")
+    patch_width: int = Field(16, description="图斑宽度(像素)")
+    mulch_sam_threshold: float = Field(0.05, description="地膜SAM角度临界阈值(弧度)")
+    num_endmembers: int = Field(4, description="VCA提取端元数量")
 
 
 class EngineContext:
@@ -289,7 +318,7 @@ def create_app(onnx_model_path: Optional[str] = None, use_gpu: bool = True) -> F
             os.unlink(tmp_data_path)
 
         try:
-            cd_map, pb_map, as_map = context.engine.predict_cube(cube)
+            cd_map, pb_map, as_map, intervention_payload = context.engine.predict_cube(cube)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"推理失败: {str(e)}")
 
@@ -319,6 +348,29 @@ def create_app(onnx_model_path: Optional[str] = None, use_gpu: bool = True) -> F
             rgba_path = os.path.join(context.output_dir, f"{run_id}_Cd_rgba.tif")
             writer.write_rgba_heatmap(cd_map, rgba_path)
 
+        intervention_dict = None
+        intervention_overlay_url = None
+
+        if intervention_payload is not None and intervention_payload.blocked:
+            intervention_dict = intervention_payload.to_dict()
+
+            H, W = cd_map.shape
+            blocked_mask = np.isnan(cd_map).astype(np.float32)
+            if np.any(blocked_mask > 0):
+                overlay_path = os.path.join(
+                    context.output_dir, f"{run_id}_intervention_overlay.tif"
+                )
+                try:
+                    writer.write_intervention_overlay(
+                        cd_map, blocked_mask, overlay_path
+                    )
+                    intervention_overlay_url = (
+                        f"/api/v1/download/{os.path.basename(overlay_path)}"
+                    )
+                    intervention_dict["overlay_url"] = intervention_overlay_url
+                except Exception:
+                    pass
+
         processing_time_s = time.time() - t0
 
         return CubeInferenceResponse(
@@ -331,6 +383,8 @@ def create_app(onnx_model_path: Optional[str] = None, use_gpu: bool = True) -> F
             ),
             processing_time_s=processing_time_s,
             spatial_shape=list(cd_map.shape),
+            intervention=intervention_dict,
+            intervention_overlay_url=intervention_overlay_url,
         )
 
     @app.get("/api/v1/download/{filename}")
@@ -342,6 +396,58 @@ def create_app(onnx_model_path: Optional[str] = None, use_gpu: bool = True) -> F
             filepath,
             media_type="image/tiff",
             filename=filename,
+        )
+
+    @app.post("/api/v1/intervention/analyze", response_model=InterventionPopupPayload)
+    async def intervention_analyze(req: InterventionAnalyzeRequest):
+        """图斑纯度干预分析端点
+
+        对上传的多光谱图斑切片执行VCA端元解混+SAM光谱角匹配,
+        当检测到地膜白色污染遮蔽时返回阻断弹窗净荷。
+        """
+        spectra = np.array(req.spectra, dtype=np.float32)
+        if spectra.ndim != 2 or spectra.shape[1] != 330:
+            raise HTTPException(
+                status_code=400,
+                detail=f"输入形状必须为 [N, 330]，当前为 {list(spectra.shape)}",
+            )
+
+        module = PurityInterventionModule(
+            mulch_sam_threshold=req.mulch_sam_threshold,
+            num_endmembers=req.num_endmembers,
+        )
+
+        patch_spectra = spectra.T.copy()
+        payload = module.analyze_patch(patch_spectra)
+
+        popup_msg = ""
+        if payload.blocked and payload.mulch_detected:
+            popup_msg = (
+                f"检测到农用聚乙烯地膜白色污染遮蔽！"
+                f"光谱角距离={payload.mulch_sam_angle:.4f}弧度"
+                f"(阈值={req.mulch_sam_threshold:.2f})，"
+                f"地膜丰度均值={payload.mulch_abundance_mean:.4f}，"
+                f"该图斑内重金属反演已被静默阻断。"
+                f"请确认地膜覆盖情况后决定是否重新启动反演。"
+            )
+
+        return InterventionPopupPayload(
+            blocked=payload.blocked,
+            mulch_detected=payload.mulch_detected,
+            mulch_sam_angle=payload.mulch_sam_angle,
+            mulch_abundance_mean=payload.mulch_abundance_mean,
+            mulch_abundance_max=payload.mulch_abundance_max,
+            mulch_endmember_index=payload.mulch_endmember_index,
+            num_endmembers=payload.num_endmembers,
+            endmember_labels=payload.endmember_labels,
+            endmember_sam_angles=payload.endmember_sam_angles,
+            abundance_means=payload.abundance_means,
+            abundance_profile_shape=(
+                list(payload.abundance_profile.shape)
+                if payload.abundance_profile is not None
+                else None
+            ),
+            popup_message=popup_msg,
         )
 
     return app
